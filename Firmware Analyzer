@@ -48,16 +48,22 @@ INVALID_IPS = {"192.168.60.200", "192.168.40.200", "192.168.20.200"}
 REQUIRED_COLS = ["digestusername", "digestrealm", "contact_domain", "ua"]
 
 COLUMN_ALIASES = {
+    # digestusername variants
+    "digest_username": "digestusername",
     "digest_user_name": "digestusername",
     "digest_user": "digestusername",
-    "realm": "digestrealm",
+    "username": "digestusername",
+    # digestrealm variants
     "digest_realm": "digestrealm",
+    "realm": "digestrealm",
+    # contact_domain variants
     "contactdomain": "contact_domain",
     "domain": "contact_domain",
+    # ua variants  (hyphens already normalised to _ before this lookup)
     "user_agent": "ua",
     "useragent": "ua",
-    # Variants of contact number -> contact_num
-    "contact-num": "contact_num",
+    # contact_num variants
+    "contact_num": "contact_num",   # identity – keeps hyphenated form working
     "contactnumber": "contact_num",
 }
 
@@ -127,7 +133,9 @@ def prioritize_valid_ip(group: pd.DataFrame) -> pd.DataFrame:
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = []
     for c in df.columns:
-        canon = c.strip().lower().replace(" ", "_")
+        # Normalise spaces AND hyphens to underscores so e.g.
+        # "User-Agent", "User Agent", "user_agent" all resolve the same way.
+        canon = c.strip().lower().replace(" ", "_").replace("-", "_")
         canon = COLUMN_ALIASES.get(canon, canon)
         new_cols.append(canon)
     df.columns = new_cols
