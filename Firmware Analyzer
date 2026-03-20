@@ -51,6 +51,7 @@ COLUMN_ALIASES = {
     "digest_user_name": "digestusername",
     "digest_user": "digestusername",
     "realm": "digestrealm",
+    "digest_realm": "digestrealm",
     "contactdomain": "contact_domain",
     "domain": "contact_domain",
     "user_agent": "ua",
@@ -171,10 +172,15 @@ def clean_and_enrich(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["DeviceKey"] = df["digestusername"].astype(str)
 
-    # For each DeviceKey + realm, prefer non-shadow IPs
+    # For each DeviceKey + realm, prefer non-shadow IPs.
+    # Avoid groupby().apply() which can silently drop grouped columns in
+    # pandas 2.x when combined with reset_index(drop=True).
+    # Instead: sort so valid (non-shadow) IPs come first, then dedupe.
+    df["__is_valid_ip__"] = ~df["contact_domain"].isin(INVALID_IPS)
     df = (
-        df.groupby(["DeviceKey", "digestrealm"], group_keys=False)
-        .apply(prioritize_valid_ip)
+        df.sort_values("__is_valid_ip__", ascending=False)
+        .drop_duplicates(subset=["DeviceKey", "digestrealm"], keep="first")
+        .drop(columns=["__is_valid_ip__"])
         .reset_index(drop=True)
     )
 
