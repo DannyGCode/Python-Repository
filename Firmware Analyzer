@@ -1,0 +1,1190 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Firmware & Domain Analyzer – Pro GUI (Grouped FW Filter + Polished UI)
+
+Dependencies (minimum):
+    pip install pandas matplotlib openpyxl xlrd
+Optional (nicer theme):
+    pip install ttkbootstrap
+
+Run:
+    python firmware_analyzer.py
+"""
+
+import re
+import csv
+import sys
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from dataclasses import dataclass
+from typing import Tuple, Optional, List, Dict
+
+# Optional modern theming
+_HAS_TTKBOOTSTRAP = False
+try:
+    import ttkbootstrap as tb  # type: ignore
+    _HAS_TTKBOOTSTRAP = True
+except Exception:
+    pass
+
+import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+
+
+APP_TITLE = "Firmware & Domain Analyzer (Pro)"
+APP_SIZE = "1280x820"
+
+# Shadow / duplicate registration IPs
+INVALID_IPS = {"192.168.60.200", "192.168.40.200", "192.168.20.200"}
+
+# These must exist in the file, but we *no longer* drop other columns.
+REQUIRED_COLS = ["digestusername", "digestrealm", "contact_domain", "ua"]
+
+COLUMN_ALIASES = {
+    "digest_user_name": "digestusername",
+    "digest_user": "digestusername",
+    "realm": "digestrealm",
+    "contactdomain": "contact_domain",
+    "domain": "contact_domain",
+    "user_agent": "ua",
+    "useragent": "ua",
+    # Variants of contact number -> contact_num
+    "contact-num": "contact_num",
+    "contactnumber": "contact_num",
+}
+
+# Shared Call Appearance / mirrored registration pattern
+# Examples: ASERA2289_m1, BNASH3110_J2, BNAWN1234_SCA1
+SCA_SUFFIX_RE = re.compile(r".+_(?:[mM]\d+|[jJ]\d+|[sS][cC][aA]\d+)$")
+
+# ---------------- Version helpers ----------------
+def _digits_tuple(version_str: Optional[str], max_len: int = 6) -> Tuple[int, ...]:
+    if not isinstance(version_str, str):
+        return (0,)
+    nums = re.findall(r"\d+", version_str)
+    if not nums:
+        return (0,)
+    parts = tuple(int(n) for n in nums[:max_len])
+    return parts or (0,)
+
+
+def _pad_tuple(t: Tuple[int, ...], length: int) -> Tuple[int, ...]:
+    if len(t) >= length:
+        return t[:length]
+    return t + (0,) * (length - len(t))
+
+
+def parse_version(version: Optional[str]) -> Tuple[int, ...]:
+    return _digits_tuple(version)
+
+
+# ---------------- UA parsing ----------------
+DEVICE_PATTERNS: List[Tuple[re.Pattern, Tuple[int, int]]] = [
+    (re.compile(r"(Yealink.*?)\s+([0-9][\w.\-]+)$", re.I), (1, 2)),
+    (re.compile(r"(Snom.*?)\s+([0-9][\w.\-]+)$", re.I), (1, 2)),
+    (re.compile(r"(Poly(?:com)? .*?)\s+([0-9][\w.\-]+)$", re.I), (1, 2)),
+    (re.compile(r"(VTech.*?)\s+([0-9][\w.\-]+)$", re.I), (1, 2)),
+    (re.compile(r"(Grandstream.*?)\s+([0-9][\w.\-]+)$", re.I), (1, 2)),
+    (re.compile(r"(.+?)[/ ]([0-9][\w.\-]+)\s*$", re.I), (1, 2)),  # generic
+]
+
+
+def extract_device_firmware(ua_value: Optional[str]) -> Tuple[str, str]:
+    if isinstance(ua_value, str):
+        ua = ua_value.strip()
+        if ua:
+            for pat, (dg, vg) in DEVICE_PATTERNS:
+                m = pat.search(ua)
+                if m:
+                    device = re.sub(r"\s+", " ", m.group(dg)).strip()
+                    ver = m.group(vg).strip()
+                    return device, ver
+    return "Unknown Device", "0.0.0"
+
+
+# ---------------- Row selection ----------------
+def prioritize_valid_ip(group: pd.DataFrame) -> pd.DataFrame:
+    """
+    For a given DeviceKey + realm group, prefer records whose contact_domain
+    is NOT in INVALID_IPS (shadow / duplicate registration IPs).
+
+    If all rows are on INVALID_IPS, we still keep one (so they can be inspected
+    on the raw/preview tab), but analytics will later drop those IPs.
+    """
+    valid = group[~group["contact_domain"].isin(INVALID_IPS)]
+    return valid.head(1) if not valid.empty else group.head(1)
+
+
+# ---------------- Data prep ----------------
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    new_cols = []
+    for c in df.columns:
+        canon = c.strip().lower().replace(" ", "_")
+        canon = COLUMN_ALIASES.get(canon, canon)
+        new_cols.append(canon)
+    df.columns = new_cols
+    return df
+
+
+def require_columns(df: pd.DataFrame) -> Optional[str]:
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return f"Required columns not found: {', '.join(missing)}.\nFound columns: {list(df.columns)}"
+    return None
+
+
+def clean_and_enrich(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main cleansing logic:
+
+    - Keep all columns (we don't drop non-REQUIRED cols).
+    - Drop rows missing REQUIRED_COLS.
+    - If contact_num exists, drop SCA/mirrored lines entirely.
+    - Build DeviceKey as contact_num (preferred) or digestusername.
+    - Per DeviceKey+realm, keep only a single row, preferring non-shadow IPs.
+    - Parse UA -> Device Type & Firmware Version.
+    - Build normalized version tuple and Marsha Code.
+    """
+    # Drop rows missing required keys
+    df = df.dropna(subset=REQUIRED_COLS).copy()
+
+    # Drop Shared Call Appearance / mirrored registrations entirely
+    if "contact_num" in df.columns:
+        sca_mask = df["contact_num"].astype(str).str.match(SCA_SUFFIX_RE)
+        df = df[~sca_mask].copy()
+
+    # Parse UA into Device Type + Firmware Version
+    df[["Device Type", "Firmware Version"]] = df["ua"].apply(
+        lambda x: pd.Series(extract_device_firmware(x))
+    )
+
+    # DeviceKey = contact_num (if present), otherwise digestusername
+    if "contact_num" in df.columns:
+        df["DeviceKey"] = df["contact_num"].astype(str)
+    else:
+        df["DeviceKey"] = df["digestusername"].astype(str)
+
+    # For each DeviceKey + realm, prefer non-shadow IPs
+    df = (
+        df.groupby(["DeviceKey", "digestrealm"], group_keys=False)
+        .apply(prioritize_valid_ip)
+        .reset_index(drop=True)
+    )
+
+    # Version normalization and Marsha derivation
+    df["Firmware Version Numeric"] = df["Firmware Version"].apply(parse_version)
+    df["__ver_norm__"] = df["Firmware Version Numeric"].apply(
+        lambda t: _pad_tuple(t, 6)
+    )
+    df["Marsha Code"] = (
+        df["digestrealm"].astype(str).str.split(".").str[0].str.upper()
+    )
+    return df
+
+
+# ---------------- Analytics helpers ----------------
+def _device_key_col(df: pd.DataFrame) -> str:
+    """
+    Internal helper: pick the right column to represent a unique phone.
+    Preference: DeviceKey -> contact_num -> digestusername.
+    """
+    if "DeviceKey" in df.columns:
+        return "DeviceKey"
+    if "contact_num" in df.columns:
+        return "contact_num"
+    return "digestusername"
+
+
+def _analytics_base(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return the canonical "one phone per DeviceKey+realm" analytics base:
+    - Drops shadow IPs entirely (INVALID_IPS).
+    - Dedupes by DeviceKey + realm.
+    """
+    key_col = _device_key_col(df)
+    return (
+        df[~df["contact_domain"].isin(INVALID_IPS)]
+        .drop_duplicates(subset=[key_col, "digestrealm"])
+        .copy()
+    )
+
+
+def marsha_count(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-Marsha stats, including percentage of the total fleet.
+    Uses DeviceKey/contact_num instead of digestusername, so
+    SCA lines and shadow IP registrations are not over-counted.
+    """
+    use = _analytics_base(df)
+
+    grouped = (
+        use.groupby(["Marsha Code", "digestrealm"], as_index=False)
+        .size()
+        .rename(columns={"size": "Count"})
+    )
+
+    total = grouped["Count"].sum()
+    if total > 0:
+        grouped["Percent of Total (%)"] = grouped["Count"].apply(
+            lambda v: f"{(v / total) * 100:.1f}%"
+        )
+    else:
+        grouped["Percent of Total (%)"] = "0.0%"
+
+    total_row = pd.DataFrame(
+        [
+            [
+                "TOTAL",
+                "ALL DOMAINS",
+                total,
+                "100.0%" if total > 0 else "0.0%",
+            ]
+        ],
+        columns=["Marsha Code", "digestrealm", "Count", "Percent of Total (%)"],
+    )
+
+    return pd.concat([grouped, total_row], ignore_index=True)
+
+
+def firmware_count(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-device-type FW stats, with 'latest', 'behind latest', and percentages.
+    Uses DeviceKey/contact_num instead of digestusername.
+    Only counts non-shadow registrations.
+    """
+    use = _analytics_base(df)
+
+    grouped = (
+        use.groupby(["Device Type", "Firmware Version"], as_index=False)
+        .size()
+        .rename(columns={"size": "Device Count"})
+    )
+
+    grouped["__ver_norm_fw__"] = grouped["Firmware Version"].apply(parse_version).apply(
+        lambda t: _pad_tuple(t, 6)
+    )
+
+    latest = (
+        grouped.sort_values(["Device Type", "__ver_norm_fw__"])
+        .groupby("Device Type", as_index=False)
+        .last()[["Device Type", "Firmware Version"]]
+        .rename(columns={"Firmware Version": "Latest Version"})
+    )
+
+    merged = grouped.merge(latest, on="Device Type", how="left")
+
+    merged["Latest __ver__"] = merged["Latest Version"].apply(parse_version).apply(
+        lambda t: _pad_tuple(t, 6)
+    )
+    merged["Is Latest?"] = merged["__ver_norm_fw__"].eq(merged["Latest __ver__"])
+    merged["Behind Latest?"] = merged["__ver_norm_fw__"] < merged["Latest __ver__"]
+
+    merged["Model Total"] = merged.groupby("Device Type")["Device Count"].transform(
+        "sum"
+    )
+    fleet_total = merged["Device Count"].sum()
+
+    def fmt_pct(n, d):
+        if not d or d == 0:
+            return "0.0%"
+        return f"{(n / d) * 100:.1f}%"
+
+    merged["Model Share (%)"] = merged.apply(
+        lambda r: fmt_pct(r["Device Count"], r["Model Total"]), axis=1
+    )
+    merged["Fleet Share (%)"] = merged.apply(
+        lambda r: fmt_pct(r["Device Count"], fleet_total), axis=1
+    )
+
+    merged = merged.sort_values(
+        by=["Device Type", "__ver_norm_fw__", "Device Count"],
+        ascending=[True, False, False],
+    )
+
+    return merged[
+        [
+            "Device Type",
+            "Firmware Version",
+            "Device Count",
+            "Latest Version",
+            "Is Latest?",
+            "Behind Latest?",
+            "Model Share (%)",
+            "Fleet Share (%)",
+        ]
+    ]
+
+
+def fw_filter(
+    df: pd.DataFrame, version_prefix: Optional[str], latest_version: Optional[str]
+) -> pd.DataFrame:
+    """
+    Outdated/filtered FW view used by the FW Filter tab.
+
+    Uses the same analytics base (contact_num+realm, no SCA, no shadow IPs).
+    """
+    use = _analytics_base(df)
+
+    if latest_version:
+        latest_tuple = _pad_tuple(parse_version(latest_version), 6)
+        use = use[use["__ver_norm__"] < latest_tuple]
+
+    if version_prefix:
+        vp = version_prefix.strip()
+        use = use[use["Firmware Version"].astype(str).str.startswith(vp)]
+
+    return use[
+        [
+            "digestusername",
+            "digestrealm",
+            "Firmware Version",
+            "Device Type",
+            "contact_domain",
+            "Marsha Code",
+        ]
+    ]
+
+
+# ---------------- UI helpers ----------------
+def make_style(root) -> ttk.Style:
+    style = ttk.Style(root)
+    if _HAS_TTKBOOTSTRAP:
+        # ttkbootstrap will handle theme
+        pass
+    else:
+        try:
+            style.theme_use("vista" if sys.platform.startswith("win") else "clam")
+        except Exception:
+            style.theme_use("clam")
+    style.configure("Card.TFrame", background="#f7f7fb")
+    style.configure("KPI.TLabel", font=("Segoe UI", 12, "bold"))
+    style.configure("Small.TLabel", font=("Segoe UI", 9))
+    style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"))
+    style.configure("Search.TEntry", padding=4)
+    style.configure("TNotebook.Tab", padding=(12, 6))
+    style.configure("Treeview", rowheight=22)
+    return style
+
+
+def treeview_sortable(tree: ttk.Treeview):
+    def sort_column(col, reverse):
+        data = [(tree.set(k, col), k) for k in tree.get_children("")]
+        try:
+            data.sort(key=lambda t: float(str(t[0]).replace(",", "")), reverse=reverse)
+        except Exception:
+            data.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+        for idx, (_, k) in enumerate(data):
+            tree.move(k, "", idx)
+        tree.heading(col, command=lambda: sort_column(col, not reverse))
+
+    for col in tree["columns"]:
+        tree.heading(col, text=col, anchor="w", command=lambda c=col: sort_column(c, False))
+
+
+def populate_tree_flat(tree: ttk.Treeview, df: pd.DataFrame):
+    tree.delete(*tree.get_children())
+    tree["columns"] = list(df.columns)
+    tree["show"] = "headings"
+    for c in df.columns:
+        tree.heading(c, text=c, anchor="w")
+        tree.column(c, width=140, anchor="w")
+    # zebra stripes
+    for i, (_, row) in enumerate(df.iterrows()):
+        tag = "odd" if i % 2 else "even"
+        tree.insert("", "end", values=[row[c] for c in df.columns], tags=(tag,))
+    tree.tag_configure("even", background="#ffffff")
+    tree.tag_configure("odd", background="#f4f6fa")
+    treeview_sortable(tree)
+
+
+def populate_tree_grouped_by_site(
+    tree: ttk.Treeview, df: pd.DataFrame, site_order: Optional[List[str]] = None
+):
+    tree.delete(*tree.get_children())
+    cols = ["digestusername", "digestrealm", "Firmware Version", "Device Type", "contact_domain"]
+    tree["columns"] = cols
+    tree["show"] = "tree headings"
+    for c in cols:
+        tree.heading(c, text=c, anchor="w")
+        tree.column(c, width=150 if c != "digestusername" else 180, anchor="w")
+
+    if site_order is None:
+        site_order = sorted(df["Marsha Code"].dropna().unique().tolist())
+
+    for site in site_order:
+        site_rows = df[df["Marsha Code"] == site]
+        if site_rows.empty:
+            continue
+        parent = tree.insert("", "end", text=f"{site}", open=True)
+        for i, (_, row) in enumerate(site_rows.iterrows()):
+            tag = "odd" if i % 2 else "even"
+            values = [
+                row["digestusername"],
+                row["digestrealm"],
+                row["Firmware Version"],
+                row["Device Type"],
+                row["contact_domain"],
+            ]
+            tree.insert(parent, "end", values=values, tags=(tag,))
+    tree.tag_configure("even", background="#ffffff")
+    tree.tag_configure("odd", background="#f4f6fa")
+
+
+def filter_tree(
+    tree: ttk.Treeview,
+    df: pd.DataFrame,
+    query: str,
+    grouped: bool,
+    site_filter: Optional[str],
+):
+    base = df
+    if site_filter and site_filter != "All":
+        base = base[base["Marsha Code"] == site_filter]
+    if query:
+        q = query.lower()
+        mask = base.apply(lambda s: s.astype(str).str.lower().str.contains(q, na=False))
+        base = base[mask.any(axis=1)]
+    if grouped:
+        populate_tree_grouped_by_site(tree, base)
+    else:
+        populate_tree_flat(tree, base)
+
+
+def copy_tree_to_clipboard(root: tk.Tk, df: pd.DataFrame):
+    text = df.to_csv(index=False)
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    messagebox.showinfo("Copied", "Current table copied to clipboard (CSV).")
+
+
+def export_table(df: pd.DataFrame, to_excel: bool):
+    ext = ".xlsx" if to_excel else ".csv"
+    f = filedialog.asksaveasfilename(
+        defaultextension=ext,
+        filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("All files", "*.*")],
+    )
+    if not f:
+        return
+    try:
+        if to_excel:
+            df.to_excel(f, index=False)
+        else:
+            df.to_csv(f, index=False)
+        messagebox.showinfo("Exported", f"Saved: {f}")
+    except Exception as e:
+        messagebox.showerror("Export failed", str(e))
+
+
+def save_current_figure():
+    f = filedialog.asksaveasfilename(
+        defaultextension=".png",
+        filetypes=[("PNG Image", "*.png"), ("All files", "*.*")],
+    )
+    if not f:
+        return
+    try:
+        plt.gcf().savefig(f, dpi=160, bbox_inches="tight")
+        messagebox.showinfo("Saved", f"Chart saved to: {f}")
+    except Exception as e:
+        messagebox.showerror("Save failed", str(e))
+
+
+# ---------------- App ----------------
+@dataclass
+class DataState:
+    raw: Optional[pd.DataFrame] = None
+    clean: Optional[pd.DataFrame] = None
+    marsha: Optional[pd.DataFrame] = None
+    fwcount: Optional[pd.DataFrame] = None
+    last_fw_filter_df: Optional[pd.DataFrame] = None
+
+
+class FirmwareAnalyzerApp:
+    def __init__(self):
+        if _HAS_TTKBOOTSTRAP:
+            self.root = tb.Window(themename="cosmo")
+        else:
+            self.root = tk.Tk()
+
+        self.root.title(APP_TITLE)
+        self.root.geometry(APP_SIZE)
+        self.root.minsize(1100, 700)
+
+        self.style = make_style(self.root)
+        self.state = DataState()
+
+        self._make_menu()
+        self._make_toolbar()
+        self._make_tabs()
+        self._make_statusbar()
+        self._bind_context_menus()
+
+    # ---------- UI skeleton ----------
+    def _make_menu(self):
+        menubar = tk.Menu(self.root)
+
+        filem = tk.Menu(menubar, tearoff=0)
+        filem.add_command(label="Load File…", command=self.load_file)
+        filem.add_command(label="Paste from Clipboard", command=self.paste_clipboard)
+        filem.add_separator()
+        filem.add_command(label="Exit", command=self.root.destroy)
+        menubar.add_cascade(label="File", menu=filem)
+
+        exportm = tk.Menu(menubar, tearoff=0)
+        exportm.add_command(
+            label="Export Current Table to CSV",
+            command=lambda: self._export_current(False),
+        )
+        exportm.add_command(
+            label="Export Current Table to Excel",
+            command=lambda: self._export_current(True),
+        )
+        exportm.add_separator()
+        exportm.add_command(
+            label="Save Current Chart as PNG", command=save_current_figure
+        )
+        menubar.add_cascade(label="Export", menu=exportm)
+
+        viewm = tk.Menu(menubar, tearoff=0)
+        if _HAS_TTKBOOTSTRAP:
+            themes = sorted(tb.Style().theme_names())
+            themem = tk.Menu(viewm, tearoff=0)
+            for name in themes:
+                themem.add_command(
+                    label=name, command=lambda n=name: tb.Style().theme_use(n)
+                )
+            viewm.add_cascade(label="Theme", menu=themem)
+        menubar.add_cascade(label="View", menu=viewm)
+
+        self.root.config(menu=menubar)
+
+    def _make_toolbar(self):
+        bar = ttk.Frame(self.root, padding=(8, 4))
+        bar.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(bar, text="Load File…", command=self.load_file).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(bar, text="Paste", command=self.paste_clipboard).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(bar, text="Refresh", command=self.update_all_tables).pack(
+            side=tk.LEFT, padx=8
+        )
+
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(bar, text="Search:", style="Small.TLabel").pack(
+            side=tk.LEFT, padx=(8, 4)
+        )
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(
+            bar, textvariable=self.search_var, width=28, style="Search.TEntry"
+        )
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.search_entry.bind("<KeyRelease>", self._on_search)
+
+    def _make_tabs(self):
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill=tk.BOTH, expand=True)
+
+        # Dashboard
+        self.tab_dash = ttk.Frame(self.nb, padding=10)
+        self.nb.add(self.tab_dash, text="Dashboard")
+
+        self.kpi_frame = ttk.Frame(self.tab_dash, style="Card.TFrame", padding=6)
+        self.kpi_frame.pack(fill=tk.X)
+        self.kpi_labels = {
+            "records": ttk.Label(
+                self.kpi_frame, text="Phones Counted: 0", style="KPI.TLabel"
+            ),
+            "unique_users": ttk.Label(
+                self.kpi_frame, text="Unique Users: 0", style="KPI.TLabel"
+            ),
+            "unique_realms": ttk.Label(
+                self.kpi_frame, text="Unique Realms: 0", style="KPI.TLabel"
+            ),
+            "device_models": ttk.Label(
+                self.kpi_frame, text="Device Models: 0", style="KPI.TLabel"
+            ),
+        }
+        for i, lab in enumerate(self.kpi_labels.values()):
+            lab.grid(row=0, column=i, padx=12, pady=6, sticky="w")
+
+        ttk.Separator(self.tab_dash).pack(fill=tk.X, pady=8)
+        ttk.Label(
+            self.tab_dash,
+            text="Recent Sample (cleaned, per registration):",
+            style="Header.TLabel",
+        ).pack(anchor="w")
+        self.tree_dash = ttk.Treeview(self.tab_dash, height=12)
+        self.tree_dash.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        # Marsha Count
+        self.tab_marsha = ttk.Frame(self.nb, padding=10)
+        self.nb.add(self.tab_marsha, text="Marsha Count")
+        self.tree_marsha = ttk.Treeview(self.tab_marsha, height=18)
+        self.tree_marsha.pack(fill=tk.BOTH, expand=True)
+
+        # Firmware Count
+        self.tab_fwcount = ttk.Frame(self.nb, padding=10)
+        self.nb.add(self.tab_fwcount, text="Firmware Count")
+        self.tree_fwcount = ttk.Treeview(self.tab_fwcount, height=18)
+        self.tree_fwcount.pack(fill=tk.BOTH, expand=True)
+
+        # FW Filter
+        self.tab_filter = ttk.Frame(self.nb, padding=10)
+        self.nb.add(self.tab_filter, text="FW Filter")
+
+        ftop = ttk.Frame(self.tab_filter)
+        ftop.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(ftop, text="Latest FW (compare):").pack(side=tk.LEFT)
+        self.latest_var = tk.StringVar()
+        ttk.Entry(ftop, textvariable=self.latest_var, width=16).pack(
+            side=tk.LEFT, padx=(6, 12)
+        )
+        ttk.Label(ftop, text="Filter Prefix:").pack(side=tk.LEFT)
+        self.prefix_var = tk.StringVar()
+        ttk.Entry(ftop, textvariable=self.prefix_var, width=16).pack(
+            side=tk.LEFT, padx=(6, 12)
+        )
+
+        self.group_sites_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ftop,
+            text="Group by site",
+            variable=self.group_sites_var,
+            command=self._apply_filter,
+        ).pack(side=tk.LEFT, padx=(6, 12))
+
+        ttk.Label(ftop, text="Site:").pack(side=tk.LEFT)
+        self.site_var = tk.StringVar(value="All")
+        self.site_combo = ttk.Combobox(
+            ftop, textvariable=self.site_var, width=18, state="readonly"
+        )
+        self.site_combo.pack(side=tk.LEFT, padx=(6, 12))
+        self.site_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_filter())
+
+        ttk.Button(ftop, text="Apply Filter", command=self._apply_filter).pack(
+            side=tk.LEFT
+        )
+
+        # NEW: Universal FW Filter search bar (site/firmware/anything text)
+        ttk.Label(ftop, text="Search (FW Filter):").pack(side=tk.LEFT, padx=(10, 4))
+        self.filter_search_var = tk.StringVar()
+        filter_entry = ttk.Entry(ftop, textvariable=self.filter_search_var, width=24)
+        filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        # Enter applies latest/prefix filter + text filter
+        filter_entry.bind("<Return>", lambda e: self._apply_filter())
+        # Typing refines current FW filter result set
+        filter_entry.bind("<KeyRelease>", self._on_filter_search)
+
+        self.tree_filter = ttk.Treeview(self.tab_filter, height=18)
+        self.tree_filter.pack(fill=tk.BOTH, expand=True)
+
+        # Visualize
+        self.tab_viz = ttk.Frame(self.nb, padding=10)
+        self.nb.add(self.tab_viz, text="Visualize")
+
+        vbar = ttk.Frame(self.tab_viz)
+        vbar.pack(fill=tk.X)
+        ttk.Button(
+            vbar, text="Top Firmware Versions", command=self._viz_top_fw
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(vbar, text="Devices by Model", command=self._viz_by_model).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(
+            vbar, text="Outdated by Model", command=self._viz_outdated_by_model
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(vbar, text="Save Chart as PNG", command=save_current_figure).pack(
+            side=tk.LEFT, padx=12
+        )
+
+        self.fig = plt.Figure(figsize=(7.5, 4.5))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.tab_viz)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=8)
+
+        # initialize empties
+        for tree in (
+            self.tree_dash,
+            self.tree_marsha,
+            self.tree_fwcount,
+            self.tree_filter,
+        ):
+            tree["columns"] = []
+            tree["show"] = "headings"
+
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._on_search())
+
+    def _make_statusbar(self):
+        self.status = ttk.Label(
+            self.root, text="Ready.", anchor="w", style="Small.TLabel"
+        )
+        self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=2)
+
+    def _bind_context_menus(self):
+        self._ctx_menu = tk.Menu(self.root, tearoff=0)
+        self._ctx_menu.add_command(
+            label="Copy selected row(s)", command=self._ctx_copy_rows
+        )
+        self._ctx_menu.add_command(
+            label="Copy table (CSV)", command=self._ctx_copy_table
+        )
+        for tree in (
+            self.tree_dash,
+            self.tree_marsha,
+            self.tree_fwcount,
+            self.tree_filter,
+        ):
+            tree.bind("<Button-3>", lambda e, t=tree: self._show_ctx_menu(e, t))
+
+    def _show_ctx_menu(self, event, tree):
+        self._ctx_target = tree
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+    def _ctx_copy_rows(self):
+        t = getattr(self, "_ctx_target", None)
+        if not t:
+            return
+        cols = t["columns"]
+        rows = []
+        for iid in t.selection():
+            rows.append(t.item(iid)["values"])
+        if not rows:
+            messagebox.showinfo("Copy", "No rows selected.")
+            return
+        df = pd.DataFrame(rows, columns=cols)
+        copy_tree_to_clipboard(self.root, df)
+
+    def _ctx_copy_table(self):
+        tree, df = self._current_tree_and_df()
+        if df is None or df.empty:
+            messagebox.showwarning("Copy", "No data on this tab.")
+            return
+        copy_tree_to_clipboard(self.root, df)
+
+    # ---------- Data I/O ----------
+    def load_file(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("Data files", "*.xlsx *.xls *.csv *.txt *.log"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+        try:
+            df = self._read_any(file_path)
+            self._ingest_dataframe(df, f"Loaded file: {file_path}")
+        except Exception as e:
+            messagebox.showerror("File Load Error", str(e))
+
+    def paste_clipboard(self):
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            messagebox.showerror("Clipboard", "No text in clipboard.")
+            return
+        try:
+            try:
+                dialect = csv.Sniffer().sniff(text.splitlines()[0] if text else ",")
+                delim = dialect.delimiter
+            except Exception:
+                delim = "\t" if "\t" in text else ","
+            from io import StringIO
+
+            df = pd.read_csv(StringIO(text), sep=delim, engine="python")
+            self._ingest_dataframe(df, "Pasted from clipboard")
+        except Exception as e:
+            messagebox.showerror("Clipboard Parse Error", str(e))
+
+    def _read_any(self, file_path: str) -> pd.DataFrame:
+        low = file_path.lower()
+        if low.endswith((".xlsx", ".xls")):
+            return pd.read_excel(file_path)
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            first = f.readline()
+        if first.lower().startswith("sep="):
+            sep = first.strip().split("=", 1)[1] or ","
+            return pd.read_csv(
+                file_path,
+                sep=sep,
+                skiprows=1,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(4096)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+            sep = dialect.delimiter
+        except Exception:
+            sep = "," if "," in sample else "\t"
+        return pd.read_csv(file_path, sep=sep, engine="python", on_bad_lines="skip")
+
+    def _ingest_dataframe(self, df: pd.DataFrame, status_msg: str):
+        df = normalize_columns(df)
+        err = require_columns(df)
+        if err:
+            messagebox.showerror("Missing Columns", err)
+            return
+        self.state.raw = df.copy()
+        self.state.clean = clean_and_enrich(df.copy())
+
+        sites = ["All"] + sorted(
+            self.state.clean["Marsha Code"].dropna().unique().tolist()
+        )
+        self.site_combo["values"] = sites
+        self.site_combo.set("All")
+
+        self.update_all_tables()
+        self._toast(status_msg)
+
+    # ---------- Tables & KPIs ----------
+    def update_all_tables(self):
+        if self.state.clean is None:
+            return
+        clean = self.state.clean
+        key_col = _device_key_col(clean)
+        analytic = _analytics_base(clean)
+
+        # KPIs are all based on contact_num+realm, no SCA, no shadow IPs
+        self.kpi_labels["records"].config(
+            text=f"Phones Counted: {len(analytic):,}"
+        )
+        self.kpi_labels["unique_users"].config(
+            text=f"Unique Users: {analytic[key_col].nunique():,}"
+        )
+        self.kpi_labels["unique_realms"].config(
+            text=f"Unique Realms: {analytic['digestrealm'].nunique():,}"
+        )
+        self.kpi_labels["device_models"].config(
+            text=f"Device Models: {analytic['Device Type'].nunique():,}"
+        )
+
+        # Dashboard sample preview (from cleaned rows, not deduped)
+        cols_dash = [
+            "digestusername",
+            "digestrealm",
+            "contact_domain",
+            "Device Type",
+            "Firmware Version",
+            "Marsha Code",
+        ]
+        sample = clean[cols_dash].head(200).copy()
+        populate_tree_flat(self.tree_dash, sample)
+
+        # Marsha & FW counts use analytics base internally
+        self.state.marsha = marsha_count(clean)
+        populate_tree_flat(self.tree_marsha, self.state.marsha)
+
+        self.state.fwcount = firmware_count(clean)
+        populate_tree_flat(self.tree_fwcount, self.state.fwcount)
+
+        # FW filter starts with all non-shadow, deduped rows
+        self.state.last_fw_filter_df = fw_filter(
+            clean, version_prefix=None, latest_version=None
+        )
+        filter_tree(
+            self.tree_filter,
+            self.state.last_fw_filter_df,
+            self.filter_search_var.get(),
+            grouped=self.group_sites_var.get(),
+            site_filter=self.site_var.get(),
+        )
+
+        # Default viz
+        self._viz_top_fw()
+
+    def _apply_filter(self):
+        if self.state.clean is None:
+            return
+        latest = self.latest_var.get().strip() or None
+        prefix = self.prefix_var.get().strip() or None
+        out = fw_filter(self.state.clean, prefix, latest)
+        self.state.last_fw_filter_df = out
+        filter_tree(
+            self.tree_filter,
+            out,
+            self.filter_search_var.get(),
+            grouped=self.group_sites_var.get(),
+            site_filter=self.site_var.get(),
+        )
+        self._toast(f"Filter applied. Rows: {len(out):,}")
+
+    # ---------- Search & Export ----------
+    def _current_tree_and_df(self):
+        tab = self.nb.tab(self.nb.select(), "text")
+        if tab == "Dashboard":
+            if self.state.clean is None:
+                return self.tree_dash, pd.DataFrame()
+            cols = [
+                "digestusername",
+                "digestrealm",
+                "contact_domain",
+                "Device Type",
+                "Firmware Version",
+                "Marsha Code",
+            ]
+            return self.tree_dash, self.state.clean[cols].head(200).copy()
+        elif tab == "Marsha Count":
+            return (
+                self.tree_marsha,
+                (self.state.marsha if self.state.marsha is not None else pd.DataFrame()),
+            )
+        elif tab == "Firmware Count":
+            return (
+                self.tree_fwcount,
+                (self.state.fwcount if self.state.fwcount is not None else pd.DataFrame()),
+            )
+        elif tab == "FW Filter":
+            df = (
+                self.state.last_fw_filter_df
+                if self.state.last_fw_filter_df is not None
+                else pd.DataFrame()
+            )
+            if df is None or df.empty:
+                return self.tree_filter, pd.DataFrame()
+            q = self.filter_search_var.get()
+            site = self.site_var.get()
+            base = df
+            if site and site != "All":
+                base = base[base["Marsha Code"] == site]
+            if q:
+                ql = q.lower()
+                mask = base.apply(
+                    lambda s: s.astype(str).str.lower().str.contains(ql, na=False)
+                )
+                base = base[mask.any(axis=1)]
+            return self.tree_filter, base.copy()
+        elif tab == "Visualize":
+            return None, None
+        return None, None
+
+    def _df_from_tree(self, tree: ttk.Treeview) -> pd.DataFrame:
+        cols = tree["columns"]
+        rows = []
+        for iid in tree.get_children(""):
+            rows.append(tree.item(iid)["values"])
+        return pd.DataFrame(rows, columns=cols)
+
+    def _on_search(self, event=None):
+        tab = self.nb.tab(self.nb.select(), "text")
+        if tab == "FW Filter" and self.state.last_fw_filter_df is not None:
+            # Top global search does NOT feed into FW Filter;
+            # FW Filter uses its own universal search bar.
+            filter_tree(
+                self.tree_filter,
+                self.state.last_fw_filter_df,
+                self.filter_search_var.get(),
+                grouped=self.group_sites_var.get(),
+                site_filter=self.site_var.get(),
+            )
+        else:
+            tree, df = self._current_tree_and_df()
+            if tree is None or df is None or df.empty:
+                return
+            # For non-FW Filter tabs, top search is global filter
+            q = self.search_var.get()
+            if not q or df.empty:
+                populate_tree_flat(tree, df)
+            else:
+                ql = q.lower()
+                mask = df.apply(
+                    lambda s: s.astype(str).str.lower().str.contains(ql, na=False)
+                )
+                base = df[mask.any(axis=1)]
+                populate_tree_flat(tree, base)
+
+    def _on_filter_search(self, event=None):
+        """
+        Live-search handler for the FW Filter tab's universal search bar.
+        This only affects the FW Filter tab and uses filter_search_var.
+        """
+        if self.state.last_fw_filter_df is None:
+            return
+        filter_tree(
+            self.tree_filter,
+            self.state.last_fw_filter_df,
+            self.filter_search_var.get(),
+            grouped=self.group_sites_var.get(),
+            site_filter=self.site_var.get(),
+        )
+
+    def _export_current(self, to_excel: bool):
+        tree, df = self._current_tree_and_df()
+        if df is None or df.empty:
+            messagebox.showwarning("Export", "No data to export on this tab.")
+            return
+        export_table(df, to_excel)
+
+    # ---------- Visualization helpers ----------
+    def _clear_ax(self):
+        self.ax.clear()
+        self.ax.set_xlabel("")
+        self.ax.set_ylabel("")
+        self.ax.set_title("")
+        self.ax.yaxis.grid(True, linestyle="--", alpha=0.3)
+
+    def _annotate_bars(self, values, total):
+        """
+        Annotate bar charts with "count (xx.x%)" labels.
+        Assumes bars were just plotted on self.ax.
+        """
+        try:
+            total_val = float(total)
+        except (TypeError, ValueError):
+            total_val = 0.0
+
+        if total_val <= 0:
+            return
+
+        for rect, val in zip(self.ax.patches, values):
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            pct = (v / total_val) * 100 if total_val else 0
+            label = f"{int(v):,} ({pct:.1f}%)"
+            height = rect.get_height()
+            x = rect.get_x() + rect.get_width() / 2
+            self.ax.annotate(
+                label,
+                (x, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    # ---------- Visualizations ----------
+    def _viz_top_fw(self):
+        if self.state.clean is None:
+            return
+
+        use = _analytics_base(self.state.clean)
+        top = use.groupby("Firmware Version").size().sort_values(ascending=False).head(10)
+
+        self._clear_ax()
+        if top.empty:
+            self.ax.text(
+                0.5,
+                0.5,
+                "No data available.",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+            )
+        else:
+            top.plot(kind="bar", ax=self.ax)
+            self.ax.set_title("Top Firmware Versions (All Models)")
+            self.ax.set_ylabel("Devices")
+
+            for label in self.ax.get_xticklabels():
+                label.set_rotation(35)
+                label.set_ha("right")
+
+            total = top.sum()
+            self._annotate_bars(top.values, total)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _viz_by_model(self):
+        if self.state.clean is None:
+            return
+
+        use = _analytics_base(self.state.clean)
+        top = use.groupby("Device Type").size().sort_values(ascending=False).head(12)
+
+        self._clear_ax()
+        if top.empty:
+            self.ax.text(
+                0.5,
+                0.5,
+                "No data available.",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+            )
+        else:
+            top.plot(kind="bar", ax=self.ax)
+            self.ax.set_title("Devices by Model (Top 12)")
+            self.ax.set_ylabel("Devices")
+
+            for label in self.ax.get_xticklabels():
+                label.set_rotation(35)
+                label.set_ha("right")
+
+            total = top.sum()
+            self._annotate_bars(top.values, total)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _viz_outdated_by_model(self):
+        if self.state.fwcount is None:
+            self.update_all_tables()
+            if self.state.fwcount is None:
+                return
+
+        fw = self.state.fwcount.copy()
+        sub = fw[fw["Behind Latest?"] == True]  # noqa: E712
+
+        self._clear_ax()
+        if sub.empty:
+            self.ax.text(
+                0.5,
+                0.5,
+                "All devices are on latest firmware (or no data).",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+            )
+        else:
+            agg = (
+                sub.groupby("Device Type")["Device Count"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(12)
+            )
+            agg.plot(kind="bar", ax=self.ax)
+            self.ax.set_title("Outdated Devices by Model (Top 12)")
+            self.ax.set_ylabel("Outdated Devices")
+
+            for label in self.ax.get_xticklabels():
+                label.set_rotation(35)
+                label.set_ha("right")
+
+            total_outdated = agg.sum()
+            self._annotate_bars(agg.values, total_outdated)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    # ---------- Toast/status ----------
+    def _toast(self, msg: str):
+        self.status.config(text=msg)
+        self.root.after(3500, lambda: self.status.config(text="Ready."))
+
+    # ---------- Main loop ----------
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------- main ----------------
+def main():
+    app = FirmwareAnalyzerApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
