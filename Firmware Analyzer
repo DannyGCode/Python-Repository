@@ -17,6 +17,7 @@ import re
 import csv
 import sys
 import tkinter as tk
+from io import StringIO
 from tkinter import ttk, messagebox, filedialog
 from dataclasses import dataclass
 from typing import Tuple, Optional, List, Dict
@@ -36,6 +37,9 @@ import matplotlib.pyplot as plt
 
 APP_TITLE = "Firmware & Domain Analyzer (Pro)"
 APP_SIZE = "1280x820"
+
+# Maximum number of version tuple components to compare (e.g. 1.2.3.4.5.6)
+VERSION_TUPLE_MAX_LEN = 6
 
 # Shadow / duplicate registration IPs
 INVALID_IPS = {"192.168.60.200", "192.168.40.200", "192.168.20.200"}
@@ -61,7 +65,7 @@ COLUMN_ALIASES = {
 SCA_SUFFIX_RE = re.compile(r".+_(?:[mM]\d+|[jJ]\d+|[sS][cC][aA]\d+)$")
 
 # ---------------- Version helpers ----------------
-def _digits_tuple(version_str: Optional[str], max_len: int = 6) -> Tuple[int, ...]:
+def _digits_tuple(version_str: Optional[str], max_len: int = VERSION_TUPLE_MAX_LEN) -> Tuple[int, ...]:
     if not isinstance(version_str, str):
         return (0,)
     nums = re.findall(r"\d+", version_str)
@@ -153,7 +157,7 @@ def clean_and_enrich(df: pd.DataFrame) -> pd.DataFrame:
 
     # Drop Shared Call Appearance / mirrored registrations entirely
     if "contact_num" in df.columns:
-        sca_mask = df["contact_num"].astype(str).str.match(SCA_SUFFIX_RE)
+        sca_mask = df["contact_num"].astype(str).str.match(SCA_SUFFIX_RE.pattern)
         df = df[~sca_mask].copy()
 
     # Parse UA into Device Type + Firmware Version
@@ -177,7 +181,7 @@ def clean_and_enrich(df: pd.DataFrame) -> pd.DataFrame:
     # Version normalization and Marsha derivation
     df["Firmware Version Numeric"] = df["Firmware Version"].apply(parse_version)
     df["__ver_norm__"] = df["Firmware Version Numeric"].apply(
-        lambda t: _pad_tuple(t, 6)
+        lambda t: _pad_tuple(t, VERSION_TUPLE_MAX_LEN)
     )
     df["Marsha Code"] = (
         df["digestrealm"].astype(str).str.split(".").str[0].str.upper()
@@ -264,7 +268,7 @@ def firmware_count(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     grouped["__ver_norm_fw__"] = grouped["Firmware Version"].apply(parse_version).apply(
-        lambda t: _pad_tuple(t, 6)
+        lambda t: _pad_tuple(t, VERSION_TUPLE_MAX_LEN)
     )
 
     latest = (
@@ -277,7 +281,7 @@ def firmware_count(df: pd.DataFrame) -> pd.DataFrame:
     merged = grouped.merge(latest, on="Device Type", how="left")
 
     merged["Latest __ver__"] = merged["Latest Version"].apply(parse_version).apply(
-        lambda t: _pad_tuple(t, 6)
+        lambda t: _pad_tuple(t, VERSION_TUPLE_MAX_LEN)
     )
     merged["Is Latest?"] = merged["__ver_norm_fw__"].eq(merged["Latest __ver__"])
     merged["Behind Latest?"] = merged["__ver_norm_fw__"] < merged["Latest __ver__"]
@@ -329,7 +333,7 @@ def fw_filter(
     use = _analytics_base(df)
 
     if latest_version:
-        latest_tuple = _pad_tuple(parse_version(latest_version), 6)
+        latest_tuple = _pad_tuple(parse_version(latest_version), VERSION_TUPLE_MAX_LEN)
         use = use[use["__ver_norm__"] < latest_tuple]
 
     if version_prefix:
@@ -453,6 +457,26 @@ def filter_tree(
         populate_tree_flat(tree, base)
 
 
+def make_scrollable_treeview(parent: tk.Widget, **kwargs) -> ttk.Treeview:
+    """
+    Create a Treeview with vertical and horizontal scrollbars packed inside
+    *parent*.  Returns the Treeview widget; scrollbars are managed internally.
+    """
+    frame = ttk.Frame(parent)
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+    hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL)
+    tree = ttk.Treeview(frame, yscrollcommand=vsb.set, xscrollcommand=hsb.set, **kwargs)
+    vsb.config(command=tree.yview)
+    hsb.config(command=tree.xview)
+
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    hsb.pack(side=tk.BOTTOM, fill=tk.X)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    return tree
+
+
 def copy_tree_to_clipboard(root: tk.Tk, df: pd.DataFrame):
     text = df.to_csv(index=False)
     root.clipboard_clear()
@@ -561,6 +585,11 @@ class FirmwareAnalyzerApp:
 
         self.root.config(menu=menubar)
 
+        # Keyboard shortcuts
+        self.root.bind_all("<Control-o>", lambda e: self.load_file())
+        self.root.bind_all("<Control-r>", lambda e: self.update_all_tables())
+        self.root.bind_all("<Control-q>", lambda e: self.root.destroy())
+
     def _make_toolbar(self):
         bar = ttk.Frame(self.root, padding=(8, 4))
         bar.pack(side=tk.TOP, fill=tk.X)
@@ -619,20 +648,17 @@ class FirmwareAnalyzerApp:
             text="Recent Sample (cleaned, per registration):",
             style="Header.TLabel",
         ).pack(anchor="w")
-        self.tree_dash = ttk.Treeview(self.tab_dash, height=12)
-        self.tree_dash.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.tree_dash = make_scrollable_treeview(self.tab_dash, height=12)
 
         # Marsha Count
         self.tab_marsha = ttk.Frame(self.nb, padding=10)
         self.nb.add(self.tab_marsha, text="Marsha Count")
-        self.tree_marsha = ttk.Treeview(self.tab_marsha, height=18)
-        self.tree_marsha.pack(fill=tk.BOTH, expand=True)
+        self.tree_marsha = make_scrollable_treeview(self.tab_marsha, height=18)
 
         # Firmware Count
         self.tab_fwcount = ttk.Frame(self.nb, padding=10)
         self.nb.add(self.tab_fwcount, text="Firmware Count")
-        self.tree_fwcount = ttk.Treeview(self.tab_fwcount, height=18)
-        self.tree_fwcount.pack(fill=tk.BOTH, expand=True)
+        self.tree_fwcount = make_scrollable_treeview(self.tab_fwcount, height=18)
 
         # FW Filter
         self.tab_filter = ttk.Frame(self.nb, padding=10)
@@ -681,8 +707,7 @@ class FirmwareAnalyzerApp:
         # Typing refines current FW filter result set
         filter_entry.bind("<KeyRelease>", self._on_filter_search)
 
-        self.tree_filter = ttk.Treeview(self.tab_filter, height=18)
-        self.tree_filter.pack(fill=tk.BOTH, expand=True)
+        self.tree_filter = make_scrollable_treeview(self.tab_filter, height=18)
 
         # Visualize
         self.tab_viz = ttk.Frame(self.nb, padding=10)
@@ -798,8 +823,6 @@ class FirmwareAnalyzerApp:
                 delim = dialect.delimiter
             except Exception:
                 delim = "\t" if "\t" in text else ","
-            from io import StringIO
-
             df = pd.read_csv(StringIO(text), sep=delim, engine="python")
             self._ingest_dataframe(df, "Pasted from clipboard")
         except Exception as e:
@@ -1137,7 +1160,7 @@ class FirmwareAnalyzerApp:
                 return
 
         fw = self.state.fwcount.copy()
-        sub = fw[fw["Behind Latest?"] == True]  # noqa: E712
+        sub = fw[fw["Behind Latest?"]]
 
         self._clear_ax()
         if sub.empty:
